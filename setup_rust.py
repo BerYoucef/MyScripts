@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🦀 setup_rust.py v2.1 - Install Rust (official MSVC target) on Windows without Visual Studio
+🦀 setup_rust.py v2.2 - Install Rust (official MSVC target) on Windows without Visual Studio
 
 Usage:
     python setup_rust.py                  full install
@@ -103,7 +103,7 @@ def err(m): print(f"  {C.RED}❌ {m}{C.R}", flush=True); log("ERR " + m)
 def banner():
     print(f"""{C.ORG}
       _~^~^~_
-  \\) /  o o  \\ (/      {C.B}{C.CYN}Rust without Visual Studio  v2.1{C.R}{C.ORG}
+  \\) /  o o  \\ (/      {C.B}{C.CYN}Rust without Visual Studio  v2.2{C.R}{C.ORG}
     '_   -   _'        {C.D}MSVC target + rust-lld + xwin{C.R}{C.ORG}
     / '-----' \\
 {C.R}""")
@@ -246,7 +246,15 @@ def verify(path, expected):
     ok("Checksum matches (integrity check) 🔎")
 
 
+def inside(root, path):
+    r = os.path.normcase(os.path.realpath(root))
+    p = os.path.normcase(os.path.realpath(path))
+    return p == r or p.startswith(r + os.sep)
+
+
 def tar_extract(t, m, out):
+    if not inside(out, os.path.join(out, m.name)):
+        raise tarfile.TarError(f"unsafe path in archive: {m.name}")
     try:
         t.extract(m, out, filter="data")      # Python 3.12+ safe extraction
     except TypeError:
@@ -375,10 +383,16 @@ def preflight(args):
     if not sys.maxsize > 2 ** 32:
         raise RuntimeError("64-bit Python required")
     ok(f"Windows x64 + Python {sys.version.split()[0]}")
-    free = shutil.disk_usage(HOME).free / 1e9
-    if free < MIN_FREE_GB:
-        raise RuntimeError(f"Only {free:.1f}GB free, at least {MIN_FREE_GB}GB required")
-    ok(f"Free disk space: {free:.1f}GB 💾")
+    drives = {}
+    for label, path in (("install (HOME)", HOME), ("downloads (TEMP)", TMP)):
+        drives.setdefault(os.path.splitdrive(os.path.abspath(path))[0].upper(), []).append((label, path))
+    for drive, uses in drives.items():
+        free = shutil.disk_usage(uses[0][1]).free / 1e9
+        need = MIN_FREE_GB if len(uses) > 1 else max(2.5, MIN_FREE_GB * 0.7)
+        names = " + ".join(u[0] for u in uses)
+        if free < need:
+            raise RuntimeError(f"Drive {drive or '?'} ({names}): only {free:.1f}GB free, need about {need:.1f}GB")
+        ok(f"Drive {drive or '?'} ({names}): {free:.1f}GB free 💾")
     env_conflicts()
     if args.check:
         return
@@ -451,8 +465,16 @@ def fetch_xwin_release():
 
 def get_xwin():
     exe = os.path.join(TMP, "xwin.exe")
-    if os.path.exists(exe):
+    vfile = exe + ".version"
+    try:
+        with open(vfile, encoding="utf-8") as f:
+            cached = f.read().strip()
+    except OSError:
+        cached = None
+    if os.path.exists(exe) and cached == XWIN_VERSION:
         return exe
+    if os.path.exists(exe):
+        info("Cached xwin is for a different version, downloading again")
     rel = fetch_xwin_release()
     asset = next(a for a in rel["assets"] if TARGET in a["name"] and a["name"].endswith(".tar.gz"))
     info(f"xwin {rel['tag_name']}")
@@ -465,6 +487,8 @@ def get_xwin():
             raise RuntimeError("xwin.exe not found inside the archive")
         m.name = "xwin.exe"
         tar_extract(t, m, TMP)
+    with open(vfile, "w", encoding="utf-8") as f:
+        f.write(XWIN_VERSION)
     return exe
 
 
@@ -533,6 +557,9 @@ def extract_llvm(arc, out):
         rest = []
         for m in pending:
             src, dst = resolve_link(out, m), os.path.join(out, os.path.normpath(m.name))
+            if not (inside(out, src) and inside(out, dst)):
+                log(f"unsafe link skipped: {m.name} -> {m.linkname}")
+                continue
             if os.path.isfile(src):
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 shutil.copy2(src, dst)
@@ -654,6 +681,14 @@ def linker_error(stderr):
     return any(k in s for k in ("linker", "lld", "lnk", "link.exe", "cannot open", "unable to find library"))
 
 
+def network_error(stderr):
+    s = stderr.lower()
+    return any(k in s for k in ("failed to download", "network failure", "could not resolve host",
+                                "unable to update registry", "spurious network error",
+                                "failed to get `cc`", "failed to query replaced source",
+                                "index.crates.io", "timed out"))
+
+
 def self_test(args):
     session_path(os.path.join(CARGO_HOME, "bin"))
     if llvm_installed():
@@ -709,7 +744,10 @@ def self_test(args):
             r = run_quiet(CARGO + ["run", "--quiet"], cproj, "Testing C and C++ builds via clang-cl")
             if r.returncode or "42 6" not in r.stdout:
                 print(r.stderr[-1500:])
-                if "hipp.cpp" in r.stderr:
+                if network_error(r.stderr):
+                    warn("Could not download the 'cc' crate (network problem), so the C/C++ test is inconclusive. "
+                         "Run --check again when online")
+                elif "hipp.cpp" in r.stderr:
                     warn("C++ build failed (C++ headers/libs problem, details in the log). C and pure Rust may still work")
                 else:
                     warn("C build failed (details in the log). Pure Rust still works")
