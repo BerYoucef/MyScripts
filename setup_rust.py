@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🦀 setup_rust.py v2.3 - Install Rust (official MSVC target) on Windows without Visual Studio
+🦀 setup_rust.py v2.4 - Install Rust (official MSVC target) on Windows without Visual Studio
 
 Usage:
     python setup_rust.py                  full install
@@ -18,6 +18,7 @@ Usage:
 """
 import argparse
 import ctypes
+import glob
 import hashlib
 import json
 import os
@@ -58,6 +59,7 @@ HOSTS = ["static.rust-lang.org", "api.github.com", "github.com", "aka.ms", "down
 # (use absolute rust-lld path, pass -Clinker-flavor=lld-link)
 VARIANTS = [(False, True), (False, False), (True, True), (True, False)]
 STATE = {"variant": 0}
+EXTRA = []   # (label, status) rows shown in the final summary
 
 
 def describe_variant(i):
@@ -103,7 +105,7 @@ def err(m): print(f"  {C.RED}❌ {m}{C.R}", flush=True); log("ERR " + m)
 def banner():
     print(f"""{C.ORG}
       _~^~^~_
-  \\) /  o o  \\ (/      {C.B}{C.CYN}Rust without Visual Studio  v2.3{C.R}{C.ORG}
+  \\) /  o o  \\ (/      {C.B}{C.CYN}Rust without Visual Studio  v2.4{C.R}{C.ORG}
     '_   -   _'        {C.D}MSVC target + rust-lld + xwin{C.R}{C.ORG}
     / '-----' \\
 {C.R}""")
@@ -329,6 +331,8 @@ def xwin_complete(root=None):
 def swap_dir(new, final):
     """Replace `final` with `new` only after `new` is complete; roll back if the swap fails."""
     old = final + ".old"
+    if os.path.exists(old) and not os.path.exists(final):
+        os.rename(old, final)              # recover the copy left by an interrupted swap
     shutil.rmtree(old, ignore_errors=True)
     if os.path.exists(final):
         os.rename(final, old)
@@ -465,6 +469,13 @@ def fetch_xwin_release():
         return gh_json(base + "latest")
 
 
+def xwin_works(exe):
+    try:
+        return subprocess.run([exe, "--version"], capture_output=True, timeout=20).returncode == 0
+    except Exception:
+        return False
+
+
 def get_xwin():
     exe = os.path.join(TMP, "xwin.exe")
     vfile = exe + ".version"
@@ -473,11 +484,11 @@ def get_xwin():
             cached = f.read().split()          # [requested, actual]
     except OSError:
         cached = []
-    if os.path.exists(exe) and cached and cached[0] == XWIN_VERSION:
+    if os.path.exists(exe) and cached and cached[0] == XWIN_VERSION and xwin_works(exe):
         info(f"Using cached xwin {cached[-1]}")
         return exe
     if os.path.exists(exe):
-        info("Cached xwin is for a different version, downloading again")
+        info("Cached xwin is outdated or damaged, downloading again")
     rel = fetch_xwin_release()
     asset = next(a for a in rel["assets"] if TARGET in a["name"] and a["name"].endswith(".tar.gz"))
     info(f"xwin {rel['tag_name']}")
@@ -542,9 +553,14 @@ def resolve_link(root, m):
     return os.path.join(root, os.path.normpath(rel))
 
 
+def is_critical(name):
+    parts = name.replace("\\", "/").split("/")
+    return any(p in ("bin", "lib", "include") for p in parts[:2])
+
+
 def extract_llvm(arc, out):
     """Extract; links (which often fail on Windows) are replaced by copies of their targets."""
-    links, failed = [], 0
+    links, failed = [], []
     with tarfile.open(arc, "r:xz") as t:
         for m in t:
             if m.issym() or m.islnk():
@@ -553,8 +569,8 @@ def extract_llvm(arc, out):
             try:
                 tar_extract(t, m, out)
             except (OSError, tarfile.TarError) as e:
-                failed += 1
-                log(f"skip {m.name}: {e}")
+                failed.append(m.name)
+                log(f"failed {m.name}: {e}")
     pending = links
     for _ in range(5):
         rest = []
@@ -571,7 +587,7 @@ def extract_llvm(arc, out):
         if not rest:
             break
         pending = rest
-    log(f"llvm extract: failed={failed}, unresolved links={len(pending)}")
+    log(f"llvm extract: failed={len(failed)}, unresolved links={len(pending)}")
     return failed, len(pending)
 
 
@@ -592,6 +608,11 @@ def install_llvm(args):
     shutil.rmtree(tmp_out, ignore_errors=True)
     with Spinner("Extracting LLVM (this takes a while)"):
         failed, unresolved = extract_llvm(arc, tmp_out)
+    critical = [n for n in failed if is_critical(n)]
+    if critical:
+        shutil.rmtree(tmp_out, ignore_errors=True)
+        raise RuntimeError(f"{len(critical)} essential LLVM files failed to extract (e.g. {critical[0]}). "
+                           "Check free disk space / antivirus, then run again")
     candidates = [os.path.join(tmp_out, n) for n in os.listdir(tmp_out)] + [tmp_out]
     top = next((c for c in candidates if os.path.isdir(c)
                 and os.path.exists(os.path.join(c, "bin", "clang-cl.exe"))), None)
@@ -602,13 +623,16 @@ def install_llvm(args):
     if missing:
         shutil.rmtree(tmp_out, ignore_errors=True)
         raise RuntimeError(f"LLVM extraction incomplete, missing: {', '.join(missing)}")
+    if not glob.glob(os.path.join(top, "lib", "clang", "*", "include", "stddef.h")):
+        shutil.rmtree(tmp_out, ignore_errors=True)
+        raise RuntimeError("clang resource headers (lib/clang/*/include) are missing, extraction incomplete")
     staging = LLVM_DIR + ".new"
     shutil.rmtree(staging, ignore_errors=True)
     shutil.move(top, staging)
     shutil.rmtree(tmp_out, ignore_errors=True)
     swap_dir(staging, LLVM_DIR)
     if failed or unresolved:
-        warn(f"{failed} files skipped, {unresolved} links unresolved (details in the log). Required tools are present")
+        warn(f"{len(failed)} non-essential files skipped, {unresolved} links unresolved (details in the log)")
     user_path("add", os.path.join(LLVM_DIR, "bin"))
     ok("LLVM (clang-cl) installed ⚙️")
 
@@ -750,12 +774,16 @@ def self_test(args):
                 if network_error(r.stderr):
                     warn("Could not download the 'cc' crate (network problem), so the C/C++ test is inconclusive. "
                          "Run --check again when online")
+                    EXTRA.append(("C/C++ via clang-cl", "inconclusive"))
                 elif "hipp.cpp" in r.stderr:
                     warn("C++ build failed (C++ headers/libs problem, details in the log). C and pure Rust may still work")
+                    EXTRA.append(("C++ via clang-cl", "FAILED"))
                 else:
                     warn("C build failed (details in the log). Pure Rust still works")
+                    EXTRA.append(("C via clang-cl", "FAILED"))
             else:
                 ok("C and C++ builds via clang-cl work ⚙️")
+                EXTRA.append(("C/C++ via clang-cl", "ok"))
 
 
 def uninstall(args):
@@ -858,11 +886,16 @@ def main():
     for title, st, sec in results:
         icon = f"{C.GRN}✔{C.R}" if st == "ok" else f"{C.RED}✘{C.R}"
         print(f"  {icon} {title:<36}{C.D}{sec:6.1f}s{C.R}")
+    for label, st in EXTRA:
+        icon = f"{C.GRN}✔{C.R}" if st == "ok" else (f"{C.RED}✘{C.R}" if st == "FAILED" else f"{C.YEL}⚠{C.R}")
+        print(f"  {icon} {label:<36}{C.D}{st}{C.R}")
     print(f"  {C.D}📝 Log: {LOG}{C.R}")
 
     if results and all(r[1] == "ok" for r in results) and len(results) == len(steps):
         print(f"\n{C.GRN}{C.B}🎉 All set!{C.R} Open a new terminal and try:")
         print(f"   {C.CYN}cargo new hello && cd hello && cargo run{C.R}")
+        if any(st != "ok" for _, st in EXTRA):
+            print(f"   {C.YEL}⚠️  Pure Rust works, but check the C/C++ result above before building C/C++ crates{C.R}")
         if not want_llvm:
             print(f"   {C.D}💡 For C/C++ crates run: python setup_rust.py --with-llvm{C.R}")
     else:
