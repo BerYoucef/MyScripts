@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🦀 setup_rust.py v2.4 - Install Rust (official MSVC target) on Windows without Visual Studio
+🦀 setup_rust.py v2.5 - Install Rust (official MSVC target) on Windows without Visual Studio
 
 Usage:
     python setup_rust.py                  full install
@@ -105,7 +105,7 @@ def err(m): print(f"  {C.RED}❌ {m}{C.R}", flush=True); log("ERR " + m)
 def banner():
     print(f"""{C.ORG}
       _~^~^~_
-  \\) /  o o  \\ (/      {C.B}{C.CYN}Rust without Visual Studio  v2.4{C.R}{C.ORG}
+  \\) /  o o  \\ (/      {C.B}{C.CYN}Rust without Visual Studio  v2.5{C.R}{C.ORG}
     '_   -   _'        {C.D}MSVC target + rust-lld + xwin{C.R}{C.ORG}
     / '-----' \\
 {C.R}""")
@@ -469,11 +469,14 @@ def fetch_xwin_release():
         return gh_json(base + "latest")
 
 
-def xwin_works(exe):
+def xwin_works(exe, expect=None):
     try:
-        return subprocess.run([exe, "--version"], capture_output=True, timeout=20).returncode == 0
+        r = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=20)
     except Exception:
         return False
+    if r.returncode != 0:
+        return False
+    return expect is None or expect.lstrip("v") in (r.stdout + r.stderr)
 
 
 def get_xwin():
@@ -484,7 +487,7 @@ def get_xwin():
             cached = f.read().split()          # [requested, actual]
     except OSError:
         cached = []
-    if os.path.exists(exe) and cached and cached[0] == XWIN_VERSION and xwin_works(exe):
+    if os.path.exists(exe) and cached and cached[0] == XWIN_VERSION and xwin_works(exe, cached[-1]):
         info(f"Using cached xwin {cached[-1]}")
         return exe
     if os.path.exists(exe):
@@ -582,13 +585,17 @@ def extract_llvm(arc, out):
             if os.path.isfile(src):
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 shutil.copy2(src, dst)
+            elif os.path.isdir(src):
+                shutil.copytree(src, dst, dirs_exist_ok=True)
             else:
                 rest.append(m)
-        if not rest:
-            break
+        stuck = len(rest) == len(pending)      # no progress this round
         pending = rest
-    log(f"llvm extract: failed={len(failed)}, unresolved links={len(pending)}")
-    return failed, len(pending)
+        if not pending or stuck:
+            break
+    names = [m.name for m in pending]
+    log(f"llvm extract: failed={len(failed)}, unresolved links={names}")
+    return failed, names
 
 
 def install_llvm(args):
@@ -632,7 +639,12 @@ def install_llvm(args):
     shutil.rmtree(tmp_out, ignore_errors=True)
     swap_dir(staging, LLVM_DIR)
     if failed or unresolved:
-        warn(f"{len(failed)} non-essential files skipped, {unresolved} links unresolved (details in the log)")
+        warn(f"{len(failed)} non-essential files skipped, {len(unresolved)} links unresolved (details in the log)")
+    crit_links = [n for n in unresolved if is_critical(n)]
+    if crit_links:
+        warn("Unresolved links inside bin/lib/include: " + ", ".join(crit_links[:5])
+             + (" ..." if len(crit_links) > 5 else ""))
+        warn("The C/C++ test at the end will show whether anything you need is affected")
     user_path("add", os.path.join(LLVM_DIR, "bin"))
     ok("LLVM (clang-cl) installed ⚙️")
 
@@ -708,6 +720,17 @@ def linker_error(stderr):
     return any(k in s for k in ("linker", "lld", "lnk", "link.exe", "cannot open", "unable to find library"))
 
 
+def config_status():
+    try:
+        with open(cargo_config_path(), encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return "missing"
+    if BEGIN not in text:
+        return "missing"
+    return "ok" if fwd(XWIN_DIR) in text[text.index(BEGIN):] else "stale"
+
+
 def network_error(stderr):
     s = stderr.lower()
     return any(k in s for k in ("failed to download", "network failure", "could not resolve host",
@@ -746,6 +769,12 @@ def self_test(args):
             print(r.stderr[-1500:])
             raise RuntimeError("Rust test project failed (full details in the log)")
         ok(f"Rust project builds and runs ✨ ({time.time() - t0:.1f}s)")
+        EXTRA.append(("Rust build (MSVC toolchain)", "ok"))
+        cs = config_status()
+        EXTRA.append(("Managed Cargo config", cs))
+        if cs != "ok":
+            warn("The build worked, but the config block written by this script is "
+                 f"{cs}: it may be succeeding through other settings (run the full install to fix)")
         if managed:
             info(f"Linker setup: {describe_variant(STATE['variant'])}")
 
@@ -787,12 +816,27 @@ def self_test(args):
 
 
 def uninstall(args):
-    if not ask("This deletes xwin, LLVM and the config block (not rustup). Continue?", False, args.yes):
+    if not ask("This deletes xwin, LLVM, the config block and this script's downloads (not rustup). Continue?",
+               False, args.yes):
         return
-    for d in (XWIN_DIR, LLVM_DIR, TMP):
+    for d in (XWIN_DIR, XWIN_DIR + ".new", XWIN_DIR + ".old",
+              LLVM_DIR, LLVM_DIR + ".new", LLVM_DIR + ".old", LLVM_DIR + ".tmp"):
         if os.path.isdir(d):
             shutil.rmtree(d, ignore_errors=True)
             ok(f"Removed {d} 🗑️")
+    ours = ["xwin-cache", "xwin.exe", "xwin.exe.version", "rustup-init.exe"]
+    for pat in ("xwin-*.tar.gz", "clang+llvm-*.tar.xz", "*.part"):
+        ours += [os.path.basename(x) for x in glob.glob(os.path.join(TMP, pat))]
+    for n in ours:
+        f = os.path.join(TMP, n)
+        try:
+            if os.path.isdir(f):
+                shutil.rmtree(f, ignore_errors=True)
+            elif os.path.exists(f):
+                os.remove(f)
+        except OSError:
+            pass
+    ok("Removed the downloads and cache created by this script")
     user_path("remove", os.path.join(LLVM_DIR, "bin"))
     path = cargo_config_path()
     if os.path.exists(path):
@@ -802,7 +846,16 @@ def uninstall(args):
             with open(path, "w", encoding="utf-8") as f:
                 f.write(strip_block(t).rstrip() + "\n")
             ok("Removed the xwin block from config.toml")
-    info("To remove Rust itself: rustup self uninstall")
+    print(f"  {C.BLU}ℹ️  To remove Rust itself: rustup self uninstall{C.R}")
+    for leftover in (LOG,):
+        try:
+            os.remove(leftover)
+        except OSError:
+            pass
+    try:
+        os.rmdir(TMP)                      # only succeeds if nothing else is inside
+    except OSError:
+        pass
 
 
 def dry_run(args, want_llvm):
@@ -895,7 +948,7 @@ def main():
         print(f"\n{C.GRN}{C.B}🎉 All set!{C.R} Open a new terminal and try:")
         print(f"   {C.CYN}cargo new hello && cd hello && cargo run{C.R}")
         if any(st != "ok" for _, st in EXTRA):
-            print(f"   {C.YEL}⚠️  Pure Rust works, but check the C/C++ result above before building C/C++ crates{C.R}")
+            print(f"   {C.YEL}⚠️  Some checks need attention (see the ⚠/✘ rows above){C.R}")
         if not want_llvm:
             print(f"   {C.D}💡 For C/C++ crates run: python setup_rust.py --with-llvm{C.R}")
     else:
