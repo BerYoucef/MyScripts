@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🦀 setup_rust.py v2.7 - Install Rust (official MSVC target) on Windows without Visual Studio
+🦀 setup_rust.py v2.8 - Install Rust (official MSVC target) on Windows without Visual Studio
 
 Usage:
     python setup_rust.py                  full install
     python setup_rust.py --with-llvm      also install LLVM (clang-cl) for crates that compile C/C++
     python setup_rust.py --no-llvm        never ask about LLVM
     python setup_rust.py --check          verify the install and run a build test only
-    python setup_rust.py --update         update Rust and re-download the CRT/SDK
+    python setup_rust.py --update         update Rust and re-download the CRT/SDK (an existing LLVM is kept; delete ~/.llvm to reinstall it)
     python setup_rust.py --dry-run        show what would be done, change nothing
     python setup_rust.py --uninstall      remove what this script installed (xwin, LLVM, config block)
     python setup_rust.py --accept-license accept the Microsoft CRT/SDK license non-interactively
@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import socket
 import subprocess
@@ -106,7 +107,7 @@ def err(m): print(f"  {C.RED}❌ {m}{C.R}", flush=True); log("ERR " + m)
 def banner():
     print(f"""{C.ORG}
       _~^~^~_
-  \\) /  o o  \\ (/      {C.B}{C.CYN}Rust without Visual Studio  v2.7{C.R}{C.ORG}
+  \\) /  o o  \\ (/      {C.B}{C.CYN}Rust without Visual Studio  v2.8{C.R}{C.ORG}
     '_   -   _'        {C.D}MSVC target + rust-lld + xwin{C.R}{C.ORG}
     / '-----' \\
 {C.R}""")
@@ -196,6 +197,10 @@ def download(url, dest, retries=4):
             with http_get(url, hdr) as r:
                 length = int(r.headers.get("Content-Length") or 0)
                 if have and getattr(r, "status", 200) == 206:
+                    cr = re.match(r"\s*bytes\s+(\d+)-", r.headers.get("Content-Range") or "")
+                    if not cr or int(cr.group(1)) != have:
+                        os.remove(part)
+                        raise OSError("server resumed from an unexpected position, restarting the download")
                     mode, total = "ab", have + length
                 else:
                     mode, total, have = "wb", length, 0
@@ -219,9 +224,16 @@ def download(url, dest, retries=4):
             os.replace(part, dest)
             return
         except urllib.error.HTTPError as e:
-            if e.code == 416 and os.path.exists(part):   # .part is already complete
-                os.replace(part, dest)
-                return
+            if e.code == 416 and os.path.exists(part):
+                m = re.search(r"/(\d+)\s*$", e.headers.get("Content-Range") or "")
+                if m and os.path.getsize(part) == int(m.group(1)):   # .part really is complete
+                    os.replace(part, dest)
+                    return
+                warn("The partial file does not match the size on the server, restarting the download")
+                os.remove(part)
+                if attempt == retries:
+                    raise
+                continue
             print()
             warn(f"HTTP {e.code} (attempt {attempt}/{retries})")
             if attempt == retries:
@@ -703,8 +715,15 @@ CXXFLAGS_x86_64_pc_windows_msvc = "{cflags}"
     return block + END + "\n"
 
 
+def block_wellformed(text):
+    """Exactly one BEGIN followed by exactly one END."""
+    return (text.count(BEGIN) == 1 and text.count(END) == 1
+            and text.index(BEGIN) < text.index(END))
+
+
 def strip_block(text):
-    if BEGIN in text and END in text:
+    """Remove our block. A damaged or duplicated block is left untouched rather than guessed at."""
+    if block_wellformed(text):
         a = text.index(BEGIN)
         b = text.index(END) + len(END)
         text = text[:a] + text[b:].lstrip("\n")
@@ -720,6 +739,11 @@ def write_cargo_config(args, quiet=False):
         with open(path, encoding="utf-8") as f:
             old = f.read()
         rest = strip_block(old)
+        if BEGIN in rest or END in rest:
+            warn("config.toml has a damaged or duplicated xwin begin/end marker; file left untouched")
+            warn("Fix or delete the marker lines by hand, then run again. Block to use:")
+            print(C.D + build_block(STATE["variant"]) + C.R)
+            return "skipped"
         if f"[target.{TARGET}]" in rest or "[env]" in rest:
             warn("config.toml already has [target] or [env] outside this script's block")
             warn("File left untouched to avoid conflicts. Copy this block manually:")
@@ -858,11 +882,15 @@ def uninstall(args):
               LLVM_DIR, LLVM_DIR + ".new", LLVM_DIR + ".old", LLVM_DIR + ".tmp"):
         if os.path.isdir(d):
             shutil.rmtree(d, ignore_errors=True)
-            ok(f"Removed {d} 🗑️")
+            if os.path.exists(d):
+                warn(f"Could not fully remove {d} (files in use? close programs using it and run again)")
+            else:
+                ok(f"Removed {d} 🗑️")
     ours = ["xwin-cache", "xwin.exe", "xwin.exe.version", "rustup-init.exe"]
     for pat in ("xwin-*.tar.gz", "clang+llvm-*.tar.xz", "xwin-*.tar.gz.part",
                 "clang+llvm-*.tar.xz.part", "rustup-init.exe.part"):
         ours += [os.path.basename(x) for x in glob.glob(os.path.join(TMP, pat))]
+    stuck = []
     for n in ours:
         f = os.path.join(TMP, n)
         try:
@@ -872,16 +900,25 @@ def uninstall(args):
                 os.remove(f)
         except OSError:
             pass
-    ok("Removed the downloads and cache created by this script")
+        if os.path.exists(f):
+            stuck.append(f)
+    if stuck:
+        warn(f"Could not remove {len(stuck)} download/cache item(s), e.g. {stuck[0]}")
+    else:
+        ok("Removed the downloads and cache created by this script")
     user_path("remove", os.path.join(LLVM_DIR, "bin"))
     path = cargo_config_path()
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
             t = f.read()
-        if BEGIN in t:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(strip_block(t).rstrip() + "\n")
-            ok("Removed the xwin block from config.toml")
+        if BEGIN in t or END in t:
+            new = strip_block(t)
+            if BEGIN in new or END in new:
+                warn("config.toml has a damaged or duplicated xwin marker; remove the block by hand")
+            else:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(new.rstrip() + "\n")
+                ok("Removed the xwin block from config.toml")
     print(f"  {C.BLU}ℹ️  To remove Rust itself: rustup self uninstall{C.R}")
     for leftover in (LOG,):
         try:
