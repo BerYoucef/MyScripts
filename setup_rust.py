@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🦀 setup_rust.py v2.5 - Install Rust (official MSVC target) on Windows without Visual Studio
+🦀 setup_rust.py v2.6 - Install Rust (official MSVC target) on Windows without Visual Studio
 
 Usage:
     python setup_rust.py                  full install
@@ -38,7 +38,7 @@ if sys.version_info < (3, 8):
     sys.exit("Python 3.8+ required")
 
 # ───────────────────────── Settings ─────────────────────────
-XWIN_VERSION = "0.6.5"          # if this tag doesn't exist, the latest release is used
+XWIN_VERSION = "0.10.0"         # 0.6.x fails on the current VS catalog; if this tag is missing (404) the latest is used
 MIN_FREE_GB = 4
 UA = "setup-rust-script"
 
@@ -105,7 +105,7 @@ def err(m): print(f"  {C.RED}❌ {m}{C.R}", flush=True); log("ERR " + m)
 def banner():
     print(f"""{C.ORG}
       _~^~^~_
-  \\) /  o o  \\ (/      {C.B}{C.CYN}Rust without Visual Studio  v2.5{C.R}{C.ORG}
+  \\) /  o o  \\ (/      {C.B}{C.CYN}Rust without Visual Studio  v2.6{C.R}{C.ORG}
     '_   -   _'        {C.D}MSVC target + rust-lld + xwin{C.R}{C.ORG}
     / '-----' \\
 {C.R}""")
@@ -174,8 +174,14 @@ def gh_json(url):
     h = {"Accept": "application/vnd.github+json"}
     if os.environ.get("GITHUB_TOKEN"):
         h["Authorization"] = "Bearer " + os.environ["GITHUB_TOKEN"]
-    with http_get(url, h) as r:
-        return json.load(r)
+    try:
+        with http_get(url, h) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        if e.code in (403, 429):
+            raise RuntimeError("GitHub API rate limit reached. Wait a while, or set the GITHUB_TOKEN "
+                               "environment variable (any token, no scopes needed) and run again")
+        raise
 
 
 def download(url, dest, retries=4):
@@ -340,7 +346,11 @@ def swap_dir(new, final):
         os.rename(new, final)
     except OSError:
         if os.path.exists(old):
-            os.rename(old, final)
+            try:
+                os.rename(old, final)
+            except OSError as e2:
+                raise RuntimeError(f"Swap failed and the automatic restore failed too. Your previous install is "
+                                   f"safe at {old}; rename it back to {final}") from e2
         raise
     shutil.rmtree(old, ignore_errors=True)
 
@@ -464,7 +474,9 @@ def fetch_xwin_release():
     base = "https://api.github.com/repos/Jake-Shadle/xwin/releases/"
     try:
         return gh_json(base + f"tags/{XWIN_VERSION}")
-    except urllib.error.HTTPError:
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise RuntimeError(f"GitHub API error {e.code} while looking up xwin {XWIN_VERSION}")
         warn(f"Version {XWIN_VERSION} not found, using the latest release")
         return gh_json(base + "latest")
 
@@ -504,6 +516,9 @@ def get_xwin():
             raise RuntimeError("xwin.exe not found inside the archive")
         m.name = "xwin.exe"
         tar_extract(t, m, TMP)
+    if not xwin_works(exe, rel["tag_name"]):
+        os.remove(exe)
+        raise RuntimeError("The downloaded xwin.exe does not run or reports a different version")
     with open(vfile, "w", encoding="utf-8") as f:
         f.write(f"{XWIN_VERSION}\n{rel['tag_name']}\n")
     return exe
@@ -695,7 +710,7 @@ def write_cargo_config(args, quiet=False):
             warn("config.toml already has [target] or [env] outside this script's block")
             warn("File left untouched to avoid conflicts. Copy this block manually:")
             print(C.D + build_block(STATE["variant"]) + C.R)
-            return
+            return "skipped"
         bak = path + ".bak"
         if not os.path.exists(bak):
             shutil.copy2(path, bak)
@@ -706,6 +721,7 @@ def write_cargo_config(args, quiet=False):
         f.write((old.rstrip() + "\n\n" if old.strip() else "") + build_block(STATE["variant"]))
     if not quiet:
         ok(f"Updated {path} 🧩")
+    return "configured"
 
 
 def run_quiet(cmd, cwd, text):
@@ -761,12 +777,14 @@ def self_test(args):
             r = run_quiet(CARGO + ["run", "--quiet"], proj, f"Building Rust ({describe_variant(idx)})")
             if r.returncode == 0 and "Hello, world!" in r.stdout:
                 break
-            if managed and linker_error(r.stderr) and idx + 1 < len(VARIANTS):
+            if managed and not args.check and linker_error(r.stderr) and idx + 1 < len(VARIANTS):
                 STATE["variant"] = idx + 1
                 warn(f"Linking failed, trying another linker setup: {describe_variant(idx + 1)}")
                 write_cargo_config(args, quiet=True)
                 continue
             print(r.stderr[-1500:])
+            if args.check and managed and linker_error(r.stderr):
+                warn("--check never edits your Cargo config. Run without --check to let the script try other linker setups")
             raise RuntimeError("Rust test project failed (full details in the log)")
         ok(f"Rust project builds and runs ✨ ({time.time() - t0:.1f}s)")
         EXTRA.append(("Rust build (MSVC toolchain)", "ok"))
@@ -825,7 +843,8 @@ def uninstall(args):
             shutil.rmtree(d, ignore_errors=True)
             ok(f"Removed {d} 🗑️")
     ours = ["xwin-cache", "xwin.exe", "xwin.exe.version", "rustup-init.exe"]
-    for pat in ("xwin-*.tar.gz", "clang+llvm-*.tar.xz", "*.part"):
+    for pat in ("xwin-*.tar.gz", "clang+llvm-*.tar.xz", "xwin-*.tar.gz.part",
+                "clang+llvm-*.tar.xz.part", "rustup-init.exe.part"):
         ours += [os.path.basename(x) for x in glob.glob(os.path.join(TMP, pat))]
     for n in ours:
         f = os.path.join(TMP, n)
@@ -924,8 +943,8 @@ def main():
         step_header(i, len(steps), title)
         t0 = time.time()
         try:
-            fn(args)
-            results.append((title, "ok", time.time() - t0))
+            res = fn(args)
+            results.append((title, "skip" if res == "skipped" else "ok", time.time() - t0))
         except KeyboardInterrupt:
             err("Interrupted by user (re-run to resume, downloads continue where they stopped)")
             sys.exit(130)
@@ -937,16 +956,19 @@ def main():
 
     print(f"\n{C.B}📊 Summary{C.R}")
     for title, st, sec in results:
-        icon = f"{C.GRN}✔{C.R}" if st == "ok" else f"{C.RED}✘{C.R}"
-        print(f"  {icon} {title:<36}{C.D}{sec:6.1f}s{C.R}")
+        icon = {"ok": f"{C.GRN}✔{C.R}", "skip": f"{C.YEL}⚠{C.R}"}.get(st, f"{C.RED}✘{C.R}")
+        note = " (skipped)" if st == "skip" else ""
+        print(f"  {icon} {title:<36}{C.D}{sec:6.1f}s{note}{C.R}")
     for label, st in EXTRA:
         icon = f"{C.GRN}✔{C.R}" if st == "ok" else (f"{C.RED}✘{C.R}" if st == "FAILED" else f"{C.YEL}⚠{C.R}")
         print(f"  {icon} {label:<36}{C.D}{st}{C.R}")
     print(f"  {C.D}📝 Log: {LOG}{C.R}")
 
-    if results and all(r[1] == "ok" for r in results) and len(results) == len(steps):
+    if results and all(r[1] in ("ok", "skip") for r in results) and len(results) == len(steps):
         print(f"\n{C.GRN}{C.B}🎉 All set!{C.R} Open a new terminal and try:")
         print(f"   {C.CYN}cargo new hello && cd hello && cargo run{C.R}")
+        if any(r[1] == "skip" for r in results):
+            print(f"   {C.YEL}⚠️  Your Cargo config was not modified: add the block shown above by hand{C.R}")
         if any(st != "ok" for _, st in EXTRA):
             print(f"   {C.YEL}⚠️  Some checks need attention (see the ⚠/✘ rows above){C.R}")
         if not want_llvm:
