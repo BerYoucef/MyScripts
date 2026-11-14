@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🦀 setup_rust.py v2.2 - Install Rust (official MSVC target) on Windows without Visual Studio
+🦀 setup_rust.py v2.3 - Install Rust (official MSVC target) on Windows without Visual Studio
 
 Usage:
     python setup_rust.py                  full install
@@ -103,7 +103,7 @@ def err(m): print(f"  {C.RED}❌ {m}{C.R}", flush=True); log("ERR " + m)
 def banner():
     print(f"""{C.ORG}
       _~^~^~_
-  \\) /  o o  \\ (/      {C.B}{C.CYN}Rust without Visual Studio  v2.2{C.R}{C.ORG}
+  \\) /  o o  \\ (/      {C.B}{C.CYN}Rust without Visual Studio  v2.3{C.R}{C.ORG}
     '_   -   _'        {C.D}MSVC target + rust-lld + xwin{C.R}{C.ORG}
     / '-----' \\
 {C.R}""")
@@ -255,6 +255,8 @@ def inside(root, path):
 def tar_extract(t, m, out):
     if not inside(out, os.path.join(out, m.name)):
         raise tarfile.TarError(f"unsafe path in archive: {m.name}")
+    if not (m.isreg() or m.isdir()):
+        raise tarfile.TarError(f"unsupported entry type in archive: {m.name}")
     try:
         t.extract(m, out, filter="data")      # Python 3.12+ safe extraction
     except TypeError:
@@ -468,10 +470,11 @@ def get_xwin():
     vfile = exe + ".version"
     try:
         with open(vfile, encoding="utf-8") as f:
-            cached = f.read().strip()
+            cached = f.read().split()          # [requested, actual]
     except OSError:
-        cached = None
-    if os.path.exists(exe) and cached == XWIN_VERSION:
+        cached = []
+    if os.path.exists(exe) and cached and cached[0] == XWIN_VERSION:
+        info(f"Using cached xwin {cached[-1]}")
         return exe
     if os.path.exists(exe):
         info("Cached xwin is for a different version, downloading again")
@@ -488,7 +491,7 @@ def get_xwin():
         m.name = "xwin.exe"
         tar_extract(t, m, TMP)
     with open(vfile, "w", encoding="utf-8") as f:
-        f.write(XWIN_VERSION)
+        f.write(f"{XWIN_VERSION}\n{rel['tag_name']}\n")
     return exe
 
 
