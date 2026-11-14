@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🦀 setup_rust.py v2.6 - Install Rust (official MSVC target) on Windows without Visual Studio
+🦀 setup_rust.py v2.7 - Install Rust (official MSVC target) on Windows without Visual Studio
 
 Usage:
     python setup_rust.py                  full install
@@ -39,7 +39,8 @@ if sys.version_info < (3, 8):
 
 # ───────────────────────── Settings ─────────────────────────
 XWIN_VERSION = "0.10.0"         # 0.6.x fails on the current VS catalog; if this tag is missing (404) the latest is used
-MIN_FREE_GB = 4
+MIN_FREE_GB = 5
+LLVM_EXTRA_GB = 4              # extra space needed when LLVM is installed (archive + extracted files)
 UA = "setup-rust-script"
 
 HOME = os.path.expanduser("~")
@@ -105,7 +106,7 @@ def err(m): print(f"  {C.RED}❌ {m}{C.R}", flush=True); log("ERR " + m)
 def banner():
     print(f"""{C.ORG}
       _~^~^~_
-  \\) /  o o  \\ (/      {C.B}{C.CYN}Rust without Visual Studio  v2.6{C.R}{C.ORG}
+  \\) /  o o  \\ (/      {C.B}{C.CYN}Rust without Visual Studio  v2.7{C.R}{C.ORG}
     '_   -   _'        {C.D}MSVC target + rust-lld + xwin{C.R}{C.ORG}
     / '-----' \\
 {C.R}""")
@@ -272,7 +273,16 @@ def tar_extract(t, m, out):
 
 
 def broadcast_env():
-    ctypes.windll.user32.SendMessageTimeoutW(0xFFFF, 0x1A, 0, "Environment", 2, 5000, None)
+    """Tell running programs that the environment changed. Never fatal: the registry is already updated."""
+    try:
+        from ctypes import wintypes
+        f = ctypes.WinDLL("user32", use_last_error=True).SendMessageTimeoutW
+        f.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPCWSTR,
+                      wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_size_t)]
+        f.restype = wintypes.LPARAM
+        f(wintypes.HWND(0xFFFF), 0x1A, 0, "Environment", 2, 5000, None)   # HWND_BROADCAST, WM_SETTINGCHANGE, SMTO_ABORTIFHUNG
+    except Exception as e:
+        log(f"broadcast_env failed: {e!r}")
 
 
 def user_path(action, folder):
@@ -299,8 +309,9 @@ def user_path(action, folder):
 
 
 def session_path(folder):
-    if folder.lower() not in os.environ["PATH"].lower():
-        os.environ["PATH"] = folder + os.pathsep + os.environ["PATH"]
+    norm = lambda s: os.path.normcase(os.path.normpath(s))
+    if norm(folder) not in (norm(p) for p in os.environ.get("PATH", "").split(os.pathsep) if p):
+        os.environ["PATH"] = folder + os.pathsep + os.environ.get("PATH", "")
 
 
 def fwd(p):
@@ -405,6 +416,8 @@ def preflight(args):
     for drive, uses in drives.items():
         free = shutil.disk_usage(uses[0][1]).free / 1e9
         need = MIN_FREE_GB if len(uses) > 1 else max(2.5, MIN_FREE_GB * 0.7)
+        if getattr(args, "want_llvm", False):
+            need += LLVM_EXTRA_GB
         names = " + ".join(u[0] for u in uses)
         if free < need:
             raise RuntimeError(f"Drive {drive or '?'} ({names}): only {free:.1f}GB free, need about {need:.1f}GB")
@@ -674,8 +687,9 @@ def build_block(variant):
                    f'  "-Lnative={p(XWIN_DIR)}/sdk/lib/ucrt/x86_64",']
     block = f"{BEGIN}\n[target.{TARGET}]\nlinker = \"{linker}\"\nrustflags = [\n" + "\n".join(flags_list) + "\n]\n"
     if llvm_installed():
-        inc = [f"{XWIN_DIR}/crt/include", f"{XWIN_DIR}/sdk/include/ucrt",
-               f"{XWIN_DIR}/sdk/include/um", f"{XWIN_DIR}/sdk/include/shared"]
+        xw = p(XWIN_DIR)      # forward slashes: backslashes would be read as TOML escapes
+        inc = [f"{xw}/crt/include", f"{xw}/sdk/include/ucrt",
+               f"{xw}/sdk/include/um", f"{xw}/sdk/include/shared"]
         cflags = " ".join(f"/imsvc {i}" for i in inc)
         b = p(os.path.join(LLVM_DIR, "bin"))
         block += f"""
@@ -770,7 +784,10 @@ def self_test(args):
     managed = config_has_block()
     with tempfile.TemporaryDirectory() as d:
         t0 = time.time()
-        run_quiet(CARGO + ["new", "hello", "--quiet"], d, "Creating test project")
+        r0 = run_quiet(CARGO + ["new", "hello", "--quiet"], d, "Creating test project")
+        if r0.returncode != 0:
+            print(r0.stderr[-1500:])
+            raise RuntimeError("`cargo new` failed, so the build test could not start (details in the log)")
         proj = os.path.join(d, "hello")
         while True:
             idx = STATE["variant"]
@@ -908,8 +925,6 @@ def main():
 
     init_console(args.no_color)
     banner()
-    os.makedirs(TMP, exist_ok=True)
-    log("=== start ===")
 
     if args.uninstall:
         uninstall(args)
@@ -918,10 +933,14 @@ def main():
     want_llvm = args.with_llvm or llvm_installed()
     if not want_llvm and not (args.no_llvm or args.check or args.yes or args.dry_run):
         want_llvm = ask("Also install LLVM (clang-cl, ~500MB+)? Needed by crates that compile C/C++ code", True)
+    args.want_llvm = want_llvm
 
     if args.dry_run:
         dry_run(args, want_llvm)
         return
+
+    os.makedirs(TMP, exist_ok=True)     # only now: --dry-run and --uninstall create nothing
+    log("=== start ===")
 
     if args.check:
         steps = [("System check", preflight), ("Verify install", self_test)]
