@@ -947,17 +947,40 @@ def dry_run(args, want_llvm):
 
 # ───────────────────────── Main ─────────────────────────
 def main():
-    ap = argparse.ArgumentParser(description="Rust on Windows without Visual Studio")
-    ap.add_argument("--with-llvm", action="store_true")
-    ap.add_argument("--no-llvm", action="store_true")
-    ap.add_argument("--check", action="store_true")
-    ap.add_argument("--update", action="store_true")
-    ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--uninstall", action="store_true")
-    ap.add_argument("--accept-license", action="store_true")
-    ap.add_argument("--set-default", action="store_true")
-    ap.add_argument("--yes", "-y", action="store_true")
-    ap.add_argument("--no-color", action="store_true")
+    ap = argparse.ArgumentParser(
+        prog="setup_rust.py",
+        description="Install Rust (official MSVC target) on Windows without Visual Studio, "
+                    "using xwin for the CRT/Windows SDK and optionally LLVM (clang-cl) for C/C++ crates.",
+        epilog="examples:\n"
+               "  python setup_rust.py --dry-run                 see what would be done (changes nothing)\n"
+               "  python setup_rust.py --with-llvm               full install including C/C++ support\n"
+               "  python setup_rust.py --no-llvm                 full install, Rust only\n"
+               "  python setup_rust.py --check                   verify an existing install\n"
+               "  python setup_rust.py --update                  update Rust and the CRT/SDK\n"
+               "  python setup_rust.py --uninstall               remove what this script installed\n"
+               "\n"
+               "log file: " + LOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--with-llvm", action="store_true",
+                    help="also install LLVM (clang-cl, ~500MB download, ~3GB on disk) for crates that compile C/C++")
+    ap.add_argument("--no-llvm", action="store_true",
+                    help="never install LLVM and do not ask about it")
+    ap.add_argument("--check", action="store_true",
+                    help="verify the install and run a build test only; never edits your Cargo config")
+    ap.add_argument("--update", action="store_true",
+                    help="update Rust and re-download the CRT/SDK (an existing LLVM is kept; delete ~/.llvm to reinstall it)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="show what would be done; no downloads, no files or folders created")
+    ap.add_argument("--uninstall", action="store_true",
+                    help="remove xwin, LLVM, downloads and the config block this script added (Rust itself stays)")
+    ap.add_argument("--accept-license", action="store_true",
+                    help="accept the Microsoft CRT/Windows SDK license without asking")
+    ap.add_argument("--set-default", action="store_true",
+                    help="make the MSVC toolchain the rustup default (otherwise an existing default is kept)")
+    ap.add_argument("--yes", "-y", action="store_true",
+                    help="accept the default answer to every question (never accepts the license)")
+    ap.add_argument("--no-color", action="store_true",
+                    help="disable colored output")
     args = ap.parse_args()
 
     init_console(args.no_color)
