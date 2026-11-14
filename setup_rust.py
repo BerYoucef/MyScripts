@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🦀 setup_rust.py v2 - Install Rust (official MSVC target) on Windows without Visual Studio
+🦀 setup_rust.py v2.1 - Install Rust (official MSVC target) on Windows without Visual Studio
 
 Usage:
     python setup_rust.py                  full install
@@ -103,7 +103,7 @@ def err(m): print(f"  {C.RED}❌ {m}{C.R}", flush=True); log("ERR " + m)
 def banner():
     print(f"""{C.ORG}
       _~^~^~_
-  \\) /  o o  \\ (/      {C.B}{C.CYN}Rust without Visual Studio  v2{C.R}{C.ORG}
+  \\) /  o o  \\ (/      {C.B}{C.CYN}Rust without Visual Studio  v2.1{C.R}{C.ORG}
     '_   -   _'        {C.D}MSVC target + rust-lld + xwin{C.R}{C.ORG}
     / '-----' \\
 {C.R}""")
@@ -299,17 +299,36 @@ def lld_path():
     return os.path.join(root, "lib", "rustlib", TARGET, "bin", "rust-lld.exe")
 
 
-XWIN_MARKERS = [
-    os.path.join(XWIN_DIR, "crt", "lib", "x86_64", "libcmt.lib"),
-    os.path.join(XWIN_DIR, "sdk", "lib", "um", "x86_64", "kernel32.lib"),
-    os.path.join(XWIN_DIR, "sdk", "lib", "ucrt", "x86_64", "ucrt.lib"),
-    os.path.join(XWIN_DIR, "sdk", "include", "um", "windows.h"),
-]
+def xwin_markers(root=None):
+    root = root or XWIN_DIR
+    return [
+        os.path.join(root, "crt", "lib", "x86_64", "libcmt.lib"),
+        os.path.join(root, "sdk", "lib", "um", "x86_64", "kernel32.lib"),
+        os.path.join(root, "sdk", "lib", "ucrt", "x86_64", "ucrt.lib"),
+        os.path.join(root, "sdk", "include", "um", "windows.h"),
+    ]
+
+
 LLVM_REQUIRED = ["clang-cl.exe", "llvm-lib.exe"]
 
 
-def xwin_complete():
-    return all(os.path.exists(m) for m in XWIN_MARKERS)
+def xwin_complete(root=None):
+    return all(os.path.exists(m) for m in xwin_markers(root))
+
+
+def swap_dir(new, final):
+    """Replace `final` with `new` only after `new` is complete; roll back if the swap fails."""
+    old = final + ".old"
+    shutil.rmtree(old, ignore_errors=True)
+    if os.path.exists(final):
+        os.rename(final, old)
+    try:
+        os.rename(new, final)
+    except OSError:
+        if os.path.exists(old):
+            os.rename(old, final)
+        raise
+    shutil.rmtree(old, ignore_errors=True)
 
 
 def llvm_installed():
@@ -460,27 +479,35 @@ def confirm_license(args):
         raise RuntimeError("License not accepted, stopping")
 
 
-def install_xwin(args):
-    if xwin_complete():
+def install_xwin(args, force=False):
+    if xwin_complete() and not force:
         ok("CRT and SDK already complete")
         return
-    if os.path.isdir(XWIN_DIR):
-        warn("Incomplete previous install found, removing and retrying")
-        shutil.rmtree(XWIN_DIR, ignore_errors=True)
+    if os.path.isdir(XWIN_DIR) and not xwin_complete():
+        warn("Incomplete previous install found, it will be replaced")
     confirm_license(args)
     xwin = get_xwin()
+    staging = XWIN_DIR + ".new"           # build in a staging folder, swap only on success
+    shutil.rmtree(staging, ignore_errors=True)
     info("Downloading CRT + Windows SDK from Microsoft (may take several minutes ☕)")
-    subprocess.check_call([xwin, "--accept-license", "--arch", "x86_64",
-                           "--cache-dir", os.path.join(TMP, "xwin-cache"),
-                           "splat", "--output", XWIN_DIR, "--disable-symlinks"])
-    if not xwin_complete():
-        raise RuntimeError("xwin finished but some essential files are missing")
+    try:
+        subprocess.check_call([xwin, "--accept-license", "--arch", "x86_64",
+                               "--cache-dir", os.path.join(TMP, "xwin-cache"),
+                               "splat", "--output", staging, "--disable-symlinks"])
+        if not xwin_complete(staging):
+            missing = [os.path.relpath(m, staging) for m in xwin_markers(staging) if not os.path.exists(m)]
+            raise RuntimeError("xwin finished but essential files are missing: " + ", ".join(missing))
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        if os.path.isdir(XWIN_DIR):
+            info("Your previous CRT/SDK was left untouched")
+        raise
+    swap_dir(staging, XWIN_DIR)
     ok("CRT and SDK ready 📚")
 
 
 def refresh_xwin(args):
-    shutil.rmtree(XWIN_DIR, ignore_errors=True)
-    install_xwin(args)
+    install_xwin(args, force=True)
 
 
 def resolve_link(root, m):
@@ -535,14 +562,21 @@ def install_llvm(args):
     shutil.rmtree(tmp_out, ignore_errors=True)
     with Spinner("Extracting LLVM (this takes a while)"):
         failed, unresolved = extract_llvm(arc, tmp_out)
-    top = os.path.join(tmp_out, os.listdir(tmp_out)[0])
-    shutil.rmtree(LLVM_DIR, ignore_errors=True)
-    shutil.move(top, LLVM_DIR)
-    shutil.rmtree(tmp_out, ignore_errors=True)
-    missing = [b for b in LLVM_REQUIRED if not os.path.exists(os.path.join(LLVM_DIR, "bin", b))]
+    candidates = [os.path.join(tmp_out, n) for n in os.listdir(tmp_out)] + [tmp_out]
+    top = next((c for c in candidates if os.path.isdir(c)
+                and os.path.exists(os.path.join(c, "bin", "clang-cl.exe"))), None)
+    if not top:
+        shutil.rmtree(tmp_out, ignore_errors=True)
+        raise RuntimeError("clang-cl.exe not found in the extracted archive (unexpected layout)")
+    missing = [b for b in LLVM_REQUIRED if not os.path.exists(os.path.join(top, "bin", b))]
     if missing:
-        shutil.rmtree(LLVM_DIR, ignore_errors=True)
+        shutil.rmtree(tmp_out, ignore_errors=True)
         raise RuntimeError(f"LLVM extraction incomplete, missing: {', '.join(missing)}")
+    staging = LLVM_DIR + ".new"
+    shutil.rmtree(staging, ignore_errors=True)
+    shutil.move(top, staging)
+    shutil.rmtree(tmp_out, ignore_errors=True)
+    swap_dir(staging, LLVM_DIR)
     if failed or unresolved:
         warn(f"{failed} files skipped, {unresolved} links unresolved (details in the log). Required tools are present")
     user_path("add", os.path.join(LLVM_DIR, "bin"))
@@ -624,10 +658,12 @@ def self_test(args):
     session_path(os.path.join(CARGO_HOME, "bin"))
     if llvm_installed():
         session_path(os.path.join(LLVM_DIR, "bin"))
-    for m in XWIN_MARKERS:
+    for m in xwin_markers():
         (ok if os.path.exists(m) else err)(os.path.relpath(m, XWIN_DIR))
     if not xwin_complete():
         raise RuntimeError("CRT/SDK files are missing, run the full install")
+    if not os.path.exists(os.path.join(XWIN_DIR, "crt", "include", "vector")):
+        warn("C++ standard library headers (crt/include/vector) not found; C++ crates may fail to build")
     if not shutil.which("cargo"):
         raise RuntimeError("cargo not found in PATH")
     managed = config_has_block()
@@ -658,17 +694,27 @@ def self_test(args):
                 f.write('[package]\nname="ctest"\nversion="0.1.0"\nedition="2021"\n'
                         '[build-dependencies]\ncc="1"\n')
             with open(os.path.join(cproj, "build.rs"), "w") as f:
-                f.write('fn main(){cc::Build::new().file("hi.c").compile("hi");}\n')
+                f.write('fn main(){\n'
+                        '  cc::Build::new().file("hi.c").compile("hi");\n'
+                        '  cc::Build::new().cpp(true).file("hipp.cpp").compile("hipp");\n}\n')
             with open(os.path.join(cproj, "hi.c"), "w") as f:
                 f.write('#include <stdio.h>\n#include <windows.h>\nint hi(void){return 42;}\n')
+            with open(os.path.join(cproj, "hipp.cpp"), "w") as f:
+                f.write('#include <string>\n#include <vector>\n#include <windows.h>\n'
+                        'extern "C" int hipp(){ std::vector<int> v{1,2,3}; std::string s("abc");'
+                        ' return (int)(v.size() + s.size()); }\n')
             with open(os.path.join(cproj, "src", "main.rs"), "w") as f:
-                f.write('extern "C"{fn hi()->i32;}\nfn main(){println!("{}",unsafe{hi()});}\n')
-            r = run_quiet(CARGO + ["run", "--quiet"], cproj, "Testing C build via clang-cl")
-            if r.returncode or "42" not in r.stdout:
+                f.write('extern "C"{fn hi()->i32; fn hipp()->i32;}\n'
+                        'fn main(){println!("{} {}",unsafe{hi()},unsafe{hipp()});}\n')
+            r = run_quiet(CARGO + ["run", "--quiet"], cproj, "Testing C and C++ builds via clang-cl")
+            if r.returncode or "42 6" not in r.stdout:
                 print(r.stderr[-1500:])
-                warn("C test failed (details in the log). Pure Rust still works")
+                if "hipp.cpp" in r.stderr:
+                    warn("C++ build failed (C++ headers/libs problem, details in the log). C and pure Rust may still work")
+                else:
+                    warn("C build failed (details in the log). Pure Rust still works")
             else:
-                ok("C/C++ build via clang-cl works ⚙️")
+                ok("C and C++ builds via clang-cl work ⚙️")
 
 
 def uninstall(args):
@@ -699,7 +745,7 @@ def dry_run(args, want_llvm):
     if want_llvm:
         row(f"Install LLVM / clang-cl into {LLVM_DIR} (~500MB+)", llvm_installed())
     row(f"Add a managed block to {cargo_config_path()}", config_has_block())
-    row("Build a test project to verify everything", False)
+    row("Build Rust (and C/C++ if LLVM) test projects to verify everything", False)
     print()
     env_conflicts()
 
