@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🦀 setup_rust.py v2.8 - Install Rust (official MSVC target) on Windows without Visual Studio
+🦀 setup_rust.py v2.9 - Install Rust (official MSVC target) on Windows without Visual Studio
 
 Usage:
     python setup_rust.py                  full install
@@ -560,12 +560,31 @@ def confirm_license(args):
         raise RuntimeError("License not accepted, stopping")
 
 
+def check_symlinks():
+    """xwin creates a directory symlink even with --disable-symlinks. Windows only allows that for
+    administrators or with Developer Mode, so test it first instead of failing after a long download."""
+    d = tempfile.mkdtemp(prefix=".symtest_", dir=HOME)
+    try:
+        os.symlink(".", os.path.join(d, "link"), target_is_directory=True)
+    except OSError as e:
+        log(f"symlink test failed: {e!r}")
+        if getattr(e, "winerror", None) == 1314:
+            raise RuntimeError(
+                "Windows does not allow this account to create symbolic links (error 1314), and xwin needs that.\n"
+                "     Fix (either one), then run the script again:\n"
+                "       1) Turn on Developer Mode: Settings > Update & Security > For developers  (Windows 11: Settings > System > For developers)\n"
+                "       2) Or run this script from a terminal opened with 'Run as administrator'")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def install_xwin(args, force=False):
     if xwin_complete() and not force:
         ok("CRT and SDK already complete")
         return
     if os.path.isdir(XWIN_DIR) and not xwin_complete():
         warn("Incomplete previous install found, it will be replaced")
+    check_symlinks()
     confirm_license(args)
     xwin = get_xwin()
     staging = XWIN_DIR + ".new"           # build in a staging folder, swap only on success
