@@ -1053,7 +1053,6 @@ def main():
         if not want_llvm:
             print(f"   {C.D}💡 For C/C++ crates run: python setup_rust.py --with-llvm{C.R}")
     else:
-        print(f"\n{C.RED}{C.B}😕 Install did not complete.{C.R} Send me the last error or the log file.")
         sys.exit(1)
 
 
