@@ -14,13 +14,16 @@ Usage:
     python setup_rust.py --accept-license accept the Microsoft CRT/SDK license non-interactively
     python setup_rust.py --set-default    make the MSVC toolchain the rustup default
     python setup_rust.py --yes            accept default answers (does NOT accept licenses)
-Companion file: vc_redist.py (same folder) installs the Visual C++ runtime needed to RUN C/C++ programs.
+Companion file: vc_redist.py (same folder, fetched automatically from GitHub if missing) installs the
+Visual C++ runtime needed to RUN C/C++ programs.
     python setup_rust.py --no-color       no colors
 """
 import argparse
+import ast
 import ctypes
 import glob
 import hashlib
+import importlib
 import json
 import os
 import platform
@@ -45,6 +48,12 @@ MIN_FREE_GB = 5
 LLVM_EXTRA_GB = 4              # extra space needed when LLVM is installed (archive + extracted files)
 UA = "setup-rust-script"
 
+# Companion script that is fetched next to this file when missing (it is imported and run, so it must be trusted).
+COMPANION_NAME = "vc_redist.py"
+COMPANION_URL = "https://raw.githubusercontent.com/BerYoucef/MyScripts/main/vc_redist.py"
+COMPANION_SHA256 = ""          # optional: put the file's SHA256 here to refuse any other content
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 HOME = os.path.expanduser("~")
 XWIN_DIR = os.path.join(HOME, ".xwin")
 LLVM_DIR = os.path.join(HOME, ".llvm")
@@ -56,7 +65,8 @@ TOOLCHAIN = "stable-x86_64-pc-windows-msvc"
 TARGET = "x86_64-pc-windows-msvc"
 CARGO = ["cargo", f"+{TOOLCHAIN}"]
 BEGIN, END = "# --- xwin begin ---", "# --- xwin end ---"
-HOSTS = ["static.rust-lang.org", "api.github.com", "github.com", "aka.ms", "download.visualstudio.microsoft.com"]
+HOSTS = ["static.rust-lang.org", "api.github.com", "github.com", "raw.githubusercontent.com", "aka.ms",
+         "download.visualstudio.microsoft.com"]
 
 # Linker setups tried in order by the self-test until one links successfully.
 # (use absolute rust-lld path, pass -Clinker-flavor=lld-link)
@@ -108,7 +118,7 @@ def err(m): print(f"  {C.RED}❌ {m}{C.R}", flush=True); log("ERR " + m)
 def banner():
     print(f"""{C.ORG}
       _~^~^~_
-  \\) /  o o  \\ (/      {C.B}{C.CYN}Rust without Visual Studio  v2.9{C.R}{C.ORG}
+  \\) /  o o  \\ (/      {C.B}{C.CYN}Rust without Visual Studio  v3.0{C.R}{C.ORG}
     '_   -   _'        {C.D}MSVC target + rust-lld + xwin{C.R}{C.ORG}
     / '-----' \\
 {C.R}""")
@@ -813,6 +823,33 @@ def network_error(stderr):
                                 "index.crates.io", "timed out"))
 
 
+def fetch_companion():
+    """Put vc_redist.py next to this script if it is missing. Never fatal: without it only the runtime step is skipped."""
+    dest = os.path.join(SCRIPT_DIR, COMPANION_NAME)
+    if os.path.exists(dest):
+        return
+    info(f"{COMPANION_NAME} is missing, fetching it from GitHub...")
+    try:
+        with http_get(COMPANION_URL, timeout=15) as r:
+            data = r.read(300_000)
+        text = data.decode("utf-8")
+        tree = ast.parse(text)                       # must at least be valid Python
+        if not any(isinstance(n, ast.FunctionDef) and n.name == "ensure" for n in tree.body):
+            raise ValueError("the file does not look like the expected companion script")
+        if COMPANION_SHA256 and hashlib.sha256(data).hexdigest() != COMPANION_SHA256.lower():
+            raise ValueError("SHA256 does not match the pinned value, refusing to use it")
+        tmp = dest + ".part"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, dest)
+        importlib.invalidate_caches()
+        ok(f"{COMPANION_NAME} saved next to the script 📥")
+    except Exception as e:
+        warn(f"Could not fetch {COMPANION_NAME} ({e}). Continuing without it: the Visual C++ runtime step "
+             f"will be skipped. You can download it yourself: {COMPANION_URL}")
+        log(f"companion fetch failed: {e!r}")
+
+
 def ensure_runtime(args):
     """Visual C++ runtime (msvcp140.dll...) is needed to RUN C/C++ programs. Logic lives in vc_redist.py."""
     try:
@@ -1060,6 +1097,7 @@ def main():
 
     os.makedirs(TMP, exist_ok=True)     # only now: --dry-run and --uninstall create nothing
     log("=== start ===")
+    fetch_companion()
 
     if args.check:
         steps = [("System check", preflight), ("Verify install", self_test)]
