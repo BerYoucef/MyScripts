@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🦀 setup_rust.py v2.9 - Install Rust (official MSVC target) on Windows without Visual Studio
+🦀 setup_rust.py v3.0 - Install Rust (official MSVC target) on Windows without Visual Studio
 
 Usage:
     python setup_rust.py                  full install
@@ -14,6 +14,7 @@ Usage:
     python setup_rust.py --accept-license accept the Microsoft CRT/SDK license non-interactively
     python setup_rust.py --set-default    make the MSVC toolchain the rustup default
     python setup_rust.py --yes            accept default answers (does NOT accept licenses)
+Companion file: vc_redist.py (same folder) installs the Visual C++ runtime needed to RUN C/C++ programs.
     python setup_rust.py --no-color       no colors
 """
 import argparse
@@ -107,7 +108,7 @@ def err(m): print(f"  {C.RED}❌ {m}{C.R}", flush=True); log("ERR " + m)
 def banner():
     print(f"""{C.ORG}
       _~^~^~_
-  \\) /  o o  \\ (/      {C.B}{C.CYN}Rust without Visual Studio  v2.8{C.R}{C.ORG}
+  \\) /  o o  \\ (/      {C.B}{C.CYN}Rust without Visual Studio  v2.9{C.R}{C.ORG}
     '_   -   _'        {C.D}MSVC target + rust-lld + xwin{C.R}{C.ORG}
     / '-----' \\
 {C.R}""")
@@ -812,6 +813,33 @@ def network_error(stderr):
                                 "index.crates.io", "timed out"))
 
 
+def ensure_runtime(args):
+    """Visual C++ runtime (msvcp140.dll...) is needed to RUN C/C++ programs. Logic lives in vc_redist.py."""
+    try:
+        import vc_redist
+    except ImportError:
+        warn("vc_redist.py not found next to this script; skipping the Visual C++ runtime check")
+        return "unknown"
+    if vc_redist.is_installed():
+        return "present"
+    if args.check:
+        warn("Visual C++ runtime (msvcp140.dll) is missing: C/C++ programs will build but not start. "
+             "Run without --check to install it")
+        return "missing"
+    if args.accept_license:
+        pass
+    elif args.yes:
+        warn("Visual C++ runtime is missing; not installed because --yes never accepts licenses "
+             "(add --accept-license, or run without --yes)")
+        return "skipped"
+    else:
+        print(f"\n  {C.YEL}C/C++ programs need the Microsoft Visual C++ Redistributable to run (msvcp140.dll).")
+        print(f"     It is installed system-wide, covered by Microsoft's license, and Windows will ask for permission.{C.R}")
+        if not ask("Download and install it now?", False):
+            return "skipped"
+    return vc_redist.ensure(download=download, info=info, ok=ok, warn=warn, log=log, tmp_dir=TMP)
+
+
 def self_test(args):
     session_path(os.path.join(CARGO_HOME, "bin"))
     if llvm_installed():
@@ -857,6 +885,12 @@ def self_test(args):
             info(f"Linker setup: {describe_variant(STATE['variant'])}")
 
         if llvm_installed():
+            rt = ensure_runtime(args)
+            can_run = rt in ("present", "installed", "reboot")
+            EXTRA.append(("Visual C++ runtime", "ok" if rt in ("present", "installed") else
+                          "reboot needed" if rt == "reboot" else rt))
+            if not can_run:
+                info("The C/C++ test will only build (not run) because the Visual C++ runtime is missing")
             cproj = os.path.join(d, "ctest")
             os.makedirs(os.path.join(cproj, "src"))
             with open(os.path.join(cproj, "Cargo.toml"), "w") as f:
@@ -875,13 +909,18 @@ def self_test(args):
             with open(os.path.join(cproj, "src", "main.rs"), "w") as f:
                 f.write('extern "C"{fn hi()->i32; fn hipp()->i32;}\n'
                         'fn main(){println!("{} {}",unsafe{hi()},unsafe{hipp()});}\n')
-            r = run_quiet(CARGO + ["run", "--quiet"], cproj, "Testing C and C++ builds via clang-cl")
-            if r.returncode or "42 6" not in r.stdout:
+            r = run_quiet(CARGO + ["run" if can_run else "build", "--quiet"], cproj,
+                          "Testing C and C++ builds via clang-cl")
+            if r.returncode or (can_run and "42 6" not in r.stdout):
                 print(r.stderr[-1500:])
                 if network_error(r.stderr):
                     warn("Could not download the 'cc' crate (network problem), so the C/C++ test is inconclusive. "
                          "Run --check again when online")
                     EXTRA.append(("C/C++ via clang-cl", "inconclusive"))
+                elif "0xc0000135" in r.stderr.lower() or "dll_not_found" in r.stderr.lower():
+                    warn("The test program was built but could not start: a runtime DLL is missing "
+                         "(Visual C++ Redistributable: https://aka.ms/vs/17/release/vc_redist.x64.exe)")
+                    EXTRA.append(("C/C++ via clang-cl", "built, runtime missing"))
                 elif "hipp.cpp" in r.stderr:
                     warn("C++ build failed (C++ headers/libs problem, details in the log). C and pure Rust may still work")
                     EXTRA.append(("C++ via clang-cl", "FAILED"))
@@ -889,8 +928,9 @@ def self_test(args):
                     warn("C build failed (details in the log). Pure Rust still works")
                     EXTRA.append(("C via clang-cl", "FAILED"))
             else:
-                ok("C and C++ builds via clang-cl work ⚙️")
-                EXTRA.append(("C/C++ via clang-cl", "ok"))
+                ok("C and C++ builds via clang-cl work ⚙️" if can_run
+                   else "C and C++ build via clang-cl (not run: runtime missing) ⚙️")
+                EXTRA.append(("C/C++ via clang-cl", "ok" if can_run else "built, not run"))
 
 
 def uninstall(args):
@@ -905,7 +945,7 @@ def uninstall(args):
                 warn(f"Could not fully remove {d} (files in use? close programs using it and run again)")
             else:
                 ok(f"Removed {d} 🗑️")
-    ours = ["xwin-cache", "xwin.exe", "xwin.exe.version", "rustup-init.exe"]
+    ours = ["xwin-cache", "xwin.exe", "xwin.exe.version", "rustup-init.exe", "vc_redist.x64.exe", "vc_redist.x64.exe.part"]
     for pat in ("xwin-*.tar.gz", "clang+llvm-*.tar.xz", "xwin-*.tar.gz.part",
                 "clang+llvm-*.tar.xz.part", "rustup-init.exe.part"):
         ours += [os.path.basename(x) for x in glob.glob(os.path.join(TMP, pat))]
