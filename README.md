@@ -209,5 +209,6 @@ rustup self uninstall
 See the repository's [LICENSE](LICENSE) file for licensing information.
 
 ---
+ 
 
 **Built for developers who want a lightweight Rust MSVC environment on Windows without installing the full Visual Studio IDE or Build Tools.** 🦀
