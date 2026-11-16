@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🦀 setup_rust.py v3.1 - Install Rust (official MSVC target) on Windows without Visual Studio
+🦀 setup_rust.py v3.2 - Install Rust (official MSVC target) on Windows without Visual Studio
 
 Usage:
     python setup_rust.py                  full install
@@ -13,6 +13,7 @@ Usage:
     python setup_rust.py --uninstall      remove what this script installed (xwin, LLVM, config block)
     python setup_rust.py --accept-license accept the Microsoft CRT/SDK license non-interactively
     python setup_rust.py --set-default    make the MSVC toolchain the rustup default
+    python setup_rust.py --debug-symbols  also keep the CRT debug symbols (.pdb) from xwin (bigger download)
     python setup_rust.py --yes            accept default answers (does NOT accept licenses)
 Companion files (same folder, fetched automatically from GitHub if missing):
     vc_redist.py   installs the Visual C++ runtime needed to RUN C/C++ programs
@@ -123,7 +124,7 @@ def err(m): print(f"  {C.RED}❌ {m}{C.R}", flush=True); log("ERR " + m)
 def banner():
     print(f"""{C.ORG}
       _~^~^~_
-  \\) /  o o  \\ (/      {C.B}{C.CYN}Rust without Visual Studio  v3.1{C.R}{C.ORG}
+  \\) /  o o  \\ (/      {C.B}{C.CYN}Rust without Visual Studio  v3.2{C.R}{C.ORG}
     '_   -   _'        {C.D}MSVC target + rust-lld + xwin{C.R}{C.ORG}
     / '-----' \\
 {C.R}""")
@@ -373,6 +374,11 @@ def xwin_complete(root=None):
     return all(os.path.exists(m) for m in xwin_markers(root))
 
 
+def has_pdbs(root=None):
+    """True if the CRT folder contains .pdb files (xwin splat --include-debug-symbols)."""
+    return bool(glob.glob(os.path.join(root or XWIN_DIR, "crt", "lib", "x86_64", "*.pdb")))
+
+
 def swap_dir(new, final):
     """Replace `final` with `new` only after `new` is complete; roll back if the swap fails."""
     old = final + ".old"
@@ -595,6 +601,10 @@ def check_symlinks():
 
 
 def install_xwin(args, force=False):
+    want_pdb = getattr(args, "debug_symbols", False)
+    if want_pdb and xwin_complete() and not force and not has_pdbs():
+        info("CRT/SDK are present but without debug symbols (.pdb), downloading again with them")
+        force = True
     if xwin_complete() and not force:
         ok("CRT and SDK already complete")
         return
@@ -607,9 +617,12 @@ def install_xwin(args, force=False):
     shutil.rmtree(staging, ignore_errors=True)
     info("Downloading CRT + Windows SDK from Microsoft (may take several minutes ☕)")
     try:
-        subprocess.check_call([xwin, "--accept-license", "--arch", "x86_64",
-                               "--cache-dir", os.path.join(TMP, "xwin-cache"),
-                               "splat", "--output", staging, "--disable-symlinks"])
+        cmd = [xwin, "--accept-license", "--arch", "x86_64",
+               "--cache-dir", os.path.join(TMP, "xwin-cache"),
+               "splat", "--output", staging, "--disable-symlinks"]
+        if want_pdb:
+            cmd.append("--include-debug-symbols")
+        subprocess.check_call(cmd)
         if not xwin_complete(staging):
             missing = [os.path.relpath(m, staging) for m in xwin_markers(staging) if not os.path.exists(m)]
             raise RuntimeError("xwin finished but essential files are missing: " + ", ".join(missing))
@@ -619,7 +632,9 @@ def install_xwin(args, force=False):
             info("Your previous CRT/SDK was left untouched")
         raise
     swap_dir(staging, XWIN_DIR)
-    ok("CRT and SDK ready 📚")
+    ok("CRT and SDK ready 📚" + (" (with debug symbols)" if want_pdb and has_pdbs() else ""))
+    if want_pdb and not has_pdbs():
+        warn("No .pdb files were found in crt/lib/x86_64: this xwin version may not include them")
 
 
 def refresh_xwin(args):
@@ -729,7 +744,8 @@ def build_block(variant):
     p = fwd
     linker = p(lld_path()) if absolute else "rust-lld"
     flags_list = ['  "-Clinker-flavor=lld-link",'] if flavor else []
-    flags_list += [f'  "-Lnative={p(XWIN_DIR)}/crt/lib/x86_64",',
+    flags_list += ['  "-Clink-arg=/ignore:4099",',      # CRT .lib files point to .pdb files that only exist on Microsoft's build machines
+                   f'  "-Lnative={p(XWIN_DIR)}/crt/lib/x86_64",',
                    f'  "-Lnative={p(XWIN_DIR)}/sdk/lib/um/x86_64",',
                    f'  "-Lnative={p(XWIN_DIR)}/sdk/lib/ucrt/x86_64",']
     block = f"{BEGIN}\n[target.{TARGET}]\nlinker = \"{linker}\"\nrustflags = [\n" + "\n".join(flags_list) + "\n]\n"
@@ -1091,7 +1107,9 @@ def dry_run(args, want_llvm):
         print(f"  {C.GRN + '✔ already done' if done else C.YEL + '➜ will run    '}{C.R}  {label}")
     print(f"{C.B}🧪 Dry run: nothing will be changed{C.R}\n")
     row("Install Rust (rustup + MSVC toolchain)", shutil.which("rustup") is not None)
-    row(f"Download CRT + Windows SDK into {XWIN_DIR} (~1.5GB, asks for license)", xwin_complete())
+    row(f"Download CRT + Windows SDK into {XWIN_DIR} (~1.5GB, asks for license)"
+        + (" + debug symbols" if args.debug_symbols else ""),
+        xwin_complete() and (has_pdbs() or not args.debug_symbols))
     if want_llvm:
         row(f"Install LLVM / clang-cl into {LLVM_DIR} (~500MB+)", llvm_installed())
     row(f"Install rc.exe (Windows SDK tools from NuGet) into {WINSDK_DIR} (~30MB, needed by Tauri)", rc_installed())
@@ -1133,6 +1151,9 @@ def main():
                     help="accept the Microsoft CRT/Windows SDK license without asking")
     ap.add_argument("--set-default", action="store_true",
                     help="make the MSVC toolchain the rustup default (otherwise an existing default is kept)")
+    ap.add_argument("--debug-symbols", action="store_true",
+                    help="also download the CRT debug symbols (.pdb) with xwin; bigger download, "
+                         "may remove the LNK4099 warnings (the script already silences them by default)")
     ap.add_argument("--yes", "-y", action="store_true",
                     help="accept the default answer to every question (never accepts the license)")
     ap.add_argument("--no-color", action="store_true",
