@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🦀 setup_rust.py v3.0 - Install Rust (official MSVC target) on Windows without Visual Studio
+🦀 setup_rust.py v3.1 - Install Rust (official MSVC target) on Windows without Visual Studio
 
 Usage:
     python setup_rust.py                  full install
@@ -14,8 +14,10 @@ Usage:
     python setup_rust.py --accept-license accept the Microsoft CRT/SDK license non-interactively
     python setup_rust.py --set-default    make the MSVC toolchain the rustup default
     python setup_rust.py --yes            accept default answers (does NOT accept licenses)
-Companion file: vc_redist.py (same folder, fetched automatically from GitHub if missing) installs the
-Visual C++ runtime needed to RUN C/C++ programs.
+Companion files (same folder, fetched automatically from GitHub if missing):
+    vc_redist.py   installs the Visual C++ runtime needed to RUN C/C++ programs
+    nuget_rc.py    installs rc.exe (Windows SDK tools from NuGet), needed to BUILD Tauri and other
+                   crates that embed icons / version info
     python setup_rust.py --no-color       no colors
 """
 import argparse
@@ -48,15 +50,18 @@ MIN_FREE_GB = 5
 LLVM_EXTRA_GB = 4              # extra space needed when LLVM is installed (archive + extracted files)
 UA = "setup-rust-script"
 
-# Companion script that is fetched next to this file when missing (it is imported and run, so it must be trusted).
-COMPANION_NAME = "vc_redist.py"
-COMPANION_URL = "https://raw.githubusercontent.com/BerYoucef/MyScripts/main/vc_redist.py"
-COMPANION_SHA256 = ""          # optional: put the file's SHA256 here to refuse any other content
+# Companion scripts that are fetched next to this file when missing (they are imported and run, so they must be trusted).
+COMPANION_BASE = "https://raw.githubusercontent.com/BerYoucef/MyScripts/main/"
+COMPANIONS = {                  # file name -> optional SHA256 (put the file's SHA256 here to refuse any other content)
+    "vc_redist.py": "",
+    "nuget_rc.py": "",
+}
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 HOME = os.path.expanduser("~")
 XWIN_DIR = os.path.join(HOME, ".xwin")
 LLVM_DIR = os.path.join(HOME, ".llvm")
+WINSDK_DIR = os.path.join(HOME, ".winsdk-tools")   # rc.exe and friends (nuget_rc.py)
 CARGO_HOME = os.environ.get("CARGO_HOME", os.path.join(HOME, ".cargo"))
 RUSTUP_HOME = os.environ.get("RUSTUP_HOME", os.path.join(HOME, ".rustup"))
 TMP = os.path.join(tempfile.gettempdir(), "rust_setup")
@@ -66,7 +71,7 @@ TARGET = "x86_64-pc-windows-msvc"
 CARGO = ["cargo", f"+{TOOLCHAIN}"]
 BEGIN, END = "# --- xwin begin ---", "# --- xwin end ---"
 HOSTS = ["static.rust-lang.org", "api.github.com", "github.com", "raw.githubusercontent.com", "aka.ms",
-         "download.visualstudio.microsoft.com"]
+         "download.visualstudio.microsoft.com", "api.nuget.org"]
 
 # Linker setups tried in order by the self-test until one links successfully.
 # (use absolute rust-lld path, pass -Clinker-flavor=lld-link)
@@ -118,7 +123,7 @@ def err(m): print(f"  {C.RED}❌ {m}{C.R}", flush=True); log("ERR " + m)
 def banner():
     print(f"""{C.ORG}
       _~^~^~_
-  \\) /  o o  \\ (/      {C.B}{C.CYN}Rust without Visual Studio  v3.0{C.R}{C.ORG}
+  \\) /  o o  \\ (/      {C.B}{C.CYN}Rust without Visual Studio  v3.1{C.R}{C.ORG}
     '_   -   _'        {C.D}MSVC target + rust-lld + xwin{C.R}{C.ORG}
     / '-----' \\
 {C.R}""")
@@ -824,30 +829,32 @@ def network_error(stderr):
 
 
 def fetch_companion():
-    """Put vc_redist.py next to this script if it is missing. Never fatal: without it only the runtime step is skipped."""
-    dest = os.path.join(SCRIPT_DIR, COMPANION_NAME)
-    if os.path.exists(dest):
-        return
-    info(f"{COMPANION_NAME} is missing, fetching it from GitHub...")
-    try:
-        with http_get(COMPANION_URL, timeout=15) as r:
-            data = r.read(300_000)
-        text = data.decode("utf-8")
-        tree = ast.parse(text)                       # must at least be valid Python
-        if not any(isinstance(n, ast.FunctionDef) and n.name == "ensure" for n in tree.body):
-            raise ValueError("the file does not look like the expected companion script")
-        if COMPANION_SHA256 and hashlib.sha256(data).hexdigest() != COMPANION_SHA256.lower():
-            raise ValueError("SHA256 does not match the pinned value, refusing to use it")
-        tmp = dest + ".part"
-        with open(tmp, "wb") as f:
-            f.write(data)
-        os.replace(tmp, dest)
-        importlib.invalidate_caches()
-        ok(f"{COMPANION_NAME} saved next to the script 📥")
-    except Exception as e:
-        warn(f"Could not fetch {COMPANION_NAME} ({e}). Continuing without it: the Visual C++ runtime step "
-             f"will be skipped. You can download it yourself: {COMPANION_URL}")
-        log(f"companion fetch failed: {e!r}")
+    """Put each companion script next to this one if it is missing. Never fatal: without one, only its step is skipped."""
+    for name, pinned in COMPANIONS.items():
+        dest = os.path.join(SCRIPT_DIR, name)
+        if os.path.exists(dest):
+            continue
+        url = COMPANION_BASE + name
+        info(f"{name} is missing, fetching it from GitHub...")
+        try:
+            with http_get(url, timeout=15) as r:
+                data = r.read(300_000)
+            text = data.decode("utf-8")
+            tree = ast.parse(text)                       # must at least be valid Python
+            if not any(isinstance(n, ast.FunctionDef) and n.name == "ensure" for n in tree.body):
+                raise ValueError("the file does not look like the expected companion script")
+            if pinned and hashlib.sha256(data).hexdigest() != pinned.lower():
+                raise ValueError("SHA256 does not match the pinned value, refusing to use it")
+            tmp = dest + ".part"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.replace(tmp, dest)
+            importlib.invalidate_caches()
+            ok(f"{name} saved next to the script 📥")
+        except Exception as e:
+            warn(f"Could not fetch {name} ({e}). Continuing without it: its step will be skipped. "
+                 f"You can download it yourself: {url}")
+            log(f"companion fetch failed ({name}): {e!r}")
 
 
 def ensure_runtime(args):
@@ -875,6 +882,53 @@ def ensure_runtime(args):
         if not ask("Download and install it now?", False):
             return "skipped"
     return vc_redist.ensure(download=download, info=info, ok=ok, warn=warn, log=log, tmp_dir=TMP)
+
+
+def rc_bin():
+    return os.path.join(WINSDK_DIR, "bin")
+
+
+def rc_installed():
+    return all(os.path.exists(os.path.join(rc_bin(), f)) for f in ("rc.exe", "rcdll.dll"))
+
+
+def ensure_rc(args):
+    """rc.exe (resource compiler) is needed to BUILD Tauri and crates that embed icons/version info.
+    xwin does not ship it, so nuget_rc.py gets it from NuGet. Returns: ok | missing | skipped | unknown | FAILED."""
+    try:
+        import nuget_rc
+    except ImportError:
+        warn("nuget_rc.py not found next to this script; skipping the rc.exe step (Tauri builds will fail without it)")
+        return "unknown"
+    if not nuget_rc.is_installed(WINSDK_DIR):
+        if args.check:
+            warn("rc.exe is missing: Tauri and crates that embed icons/version info will not build. "
+                 "Run without --check to install it")
+            return "missing"
+        if args.accept_license:
+            pass
+        elif args.yes:
+            warn("rc.exe is missing; not installed because --yes never accepts licenses "
+                 "(add --accept-license, or run without --yes)")
+            return "skipped"
+        else:
+            print(f"\n  {C.YEL}Tauri needs rc.exe (Windows SDK resource compiler) to build. xwin does not include it.")
+            print(f"     It comes from Microsoft's NuGet package, is covered by the Windows SDK license, "
+                  f"and installs per-user (~{WINSDK_DIR}).{C.R}")
+            if not ask("Download and install it now?", True):
+                return "skipped"
+        if nuget_rc.ensure(download=download, info=info, ok=ok, warn=warn, log=log, tmp_dir=TMP,
+                           root=WINSDK_DIR) == "failed":
+            return "FAILED"
+    session_path(rc_bin())
+    if not args.check:
+        if user_path("add", rc_bin()):
+            ok("Added the Windows SDK tools folder to your PATH (open a new terminal to use it)")
+    if not nuget_rc.test(WINSDK_DIR, TMP):
+        warn("rc.exe is installed but a test compile failed (details: run rc.exe by hand)")
+        return "FAILED"
+    ok("rc.exe compiles a test resource file 🧰")
+    return "ok"
 
 
 def self_test(args):
@@ -920,6 +974,8 @@ def self_test(args):
                  f"{cs}: it may be succeeding through other settings (run the full install to fix)")
         if managed:
             info(f"Linker setup: {describe_variant(STATE['variant'])}")
+
+        EXTRA.append(("Resource compiler (rc.exe)", ensure_rc(args)))
 
         if llvm_installed():
             rt = ensure_runtime(args)
@@ -971,18 +1027,20 @@ def self_test(args):
 
 
 def uninstall(args):
-    if not ask("This deletes xwin, LLVM, the config block and this script's downloads (not rustup). Continue?",
+    if not ask("This deletes xwin, LLVM, rc.exe tools, the config block and this script's downloads (not rustup). Continue?",
                False, args.yes):
         return
     for d in (XWIN_DIR, XWIN_DIR + ".new", XWIN_DIR + ".old",
-              LLVM_DIR, LLVM_DIR + ".new", LLVM_DIR + ".old", LLVM_DIR + ".tmp"):
+              LLVM_DIR, LLVM_DIR + ".new", LLVM_DIR + ".old", LLVM_DIR + ".tmp",
+              WINSDK_DIR, WINSDK_DIR + ".new", WINSDK_DIR + ".old"):
         if os.path.isdir(d):
             shutil.rmtree(d, ignore_errors=True)
             if os.path.exists(d):
                 warn(f"Could not fully remove {d} (files in use? close programs using it and run again)")
             else:
                 ok(f"Removed {d} 🗑️")
-    ours = ["xwin-cache", "xwin.exe", "xwin.exe.version", "rustup-init.exe", "vc_redist.x64.exe", "vc_redist.x64.exe.part"]
+    ours = ["xwin-cache", "xwin.exe", "xwin.exe.version", "rustup-init.exe", "vc_redist.x64.exe", "vc_redist.x64.exe.part",
+            "buildtools.nupkg", "buildtools.nupkg.part"]
     for pat in ("xwin-*.tar.gz", "clang+llvm-*.tar.xz", "xwin-*.tar.gz.part",
                 "clang+llvm-*.tar.xz.part", "rustup-init.exe.part"):
         ours += [os.path.basename(x) for x in glob.glob(os.path.join(TMP, pat))]
@@ -1003,6 +1061,7 @@ def uninstall(args):
     else:
         ok("Removed the downloads and cache created by this script")
     user_path("remove", os.path.join(LLVM_DIR, "bin"))
+    user_path("remove", rc_bin())
     path = cargo_config_path()
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
@@ -1035,6 +1094,7 @@ def dry_run(args, want_llvm):
     row(f"Download CRT + Windows SDK into {XWIN_DIR} (~1.5GB, asks for license)", xwin_complete())
     if want_llvm:
         row(f"Install LLVM / clang-cl into {LLVM_DIR} (~500MB+)", llvm_installed())
+    row(f"Install rc.exe (Windows SDK tools from NuGet) into {WINSDK_DIR} (~30MB, needed by Tauri)", rc_installed())
     row(f"Add a managed block to {cargo_config_path()}", config_has_block())
     row("Build Rust (and C/C++ if LLVM) test projects to verify everything", False)
     print()
